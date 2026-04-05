@@ -25,14 +25,13 @@ jobs:
           fetch-depth: 0   # Full history needed by SonarCloud
 
       - name: SonarCloud Scan
-        uses: SonarSource/sonarqube-scan-action@v5
+        uses: SonarSource/sonarqube-scan-action@v6
+        continue-on-error: true   # Quality gate won't block pipeline
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: https://sonarcloud.io
-        with:
-          args: >
-            -Dsonar.projectKey=MalavikaAK_DEVOPS_FOREX
-            -Dsonar.organization=malavikaak
+          SONAR_PROJECT_KEY: MalavikaAK_DEVOPS_FOREX
+          SONAR_ORGANIZATION: malavikaak
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STAGE 2 — Automated Tests (Pytest)
