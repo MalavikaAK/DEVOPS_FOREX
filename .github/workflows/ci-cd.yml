@@ -168,20 +168,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Build & deploy frontend to S3
-      - name: Setup Node 20
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Install & Build Frontend
-        run: |
-          cd frontend
-          npm ci
-          npm run build
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -189,17 +175,7 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ env.AWS_REGION }}
 
-      - name: Deploy Frontend → S3
-        run: |
-          aws s3 sync frontend/dist/ s3://${{ env.S3_BUCKET }} \
-            --delete \
-            --cache-control "max-age=31536000,public" \
-            --exclude "index.html"
-          # No-cache for index.html so users always get the latest
-          aws s3 cp frontend/dist/index.html s3://${{ env.S3_BUCKET }}/index.html \
-            --cache-control "no-cache,no-store,must-revalidate"
-
-      # Terraform IaC for prod infrastructure
+      # ── STEP 1: Terraform creates S3 bucket & infrastructure FIRST ──────────
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -215,8 +191,33 @@ jobs:
             -var="db_password=${{ secrets.DB_PASSWORD }}" \
             -var="frontend_bucket_name=${{ env.S3_BUCKET }}"
 
+      # ── STEP 2: Build frontend ───────────────────────────────────────────────
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install & Build Frontend
+        run: |
+          cd frontend
+          npm ci
+          npm run build
+
+      # ── STEP 3: Deploy to S3 (bucket now exists from Terraform) ─────────────
+      - name: Deploy Frontend → S3
+        run: |
+          aws s3 sync frontend/dist/ s3://${{ env.S3_BUCKET }} \
+            --delete \
+            --cache-control "max-age=31536000,public" \
+            --exclude "index.html"
+          aws s3 cp frontend/dist/index.html s3://${{ env.S3_BUCKET }}/index.html \
+            --cache-control "no-cache,no-store,must-revalidate"
+
+      # ── STEP 4: Redeploy backend on ECS ─────────────────────────────────────
       - name: Force new ECS deployment (Production)
-        continue-on-error: true   # Graceful if ECS service not yet created
+        continue-on-error: true
         run: |
           aws ecs update-service \
             --cluster ${{ env.ECS_CLUSTER }} \
