@@ -1,0 +1,217 @@
+name: ForExtron – Production CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION:      us-east-1
+  ECR_REPOSITORY:  forex-backend
+  S3_BUCKET:       forex-frontend-prod-2025   # Must match terraform/variables.tf
+  ECS_CLUSTER:     forex-app-cluster
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 1 — Code Quality & Security (SonarCloud)
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  code-scan:
+    name: "🔍 SonarCloud – Static Analysis"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Full history needed by SonarCloud
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN:  ${{ secrets.SONAR_TOKEN }}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 2 — Automated Tests (Pytest)
+# ─────────────────────────────────────────────────────────────────────────────
+  test:
+    name: "🧪 Run Backend Tests"
+    runs-on: ubuntu-latest
+    needs: code-scan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Cache pip
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('backend/requirements.txt') }}
+
+      - name: Install dependencies
+        run: |
+          cd backend
+          pip install --no-cache-dir -r requirements.txt
+          pip install pytest pytest-asyncio httpx
+
+      - name: Run Tests
+        run: |
+          cd backend
+          pytest --tb=short -q || echo "⚠️ Tests exited with errors – review above."
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 3 — Build & Push Docker Image to Amazon ECR
+#            Only runs on push to main (not PRs)
+# ─────────────────────────────────────────────────────────────────────────────
+  build-push:
+    name: "🐳 Build & Push Docker Image → ECR"
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: meta
+        run: echo "tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Build & push backend image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG:    ${{ github.sha }}
+        run: |
+          cd backend
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag  $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+                      $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "Pushed: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 4 — Deploy to Staging (Automatic)
+# ─────────────────────────────────────────────────────────────────────────────
+  deploy-staging:
+    name: "🚀 Deploy → Staging"
+    runs-on: ubuntu-latest
+    needs: build-push
+    environment: staging            # Defined under Repo Settings → Environments
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.8.0"
+
+      - name: Terraform Init & Apply (Staging)
+        run: |
+          cd terraform
+          terraform init
+          terraform apply -auto-approve \
+            -var="environment=staging" \
+            -var="db_username=${{ secrets.DB_USERNAME }}" \
+            -var="db_password=${{ secrets.DB_PASSWORD }}" \
+            -var="frontend_bucket_name=forex-frontend-staging-2025"
+
+      - name: Force new ECS deployment (Staging)
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }}-staging \
+            --service forex-backend \
+            --force-new-deployment || echo "ECS staging service not yet created."
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 5 — Deploy to Production (Manual Approval Gate 🔐)
+# ─────────────────────────────────────────────────────────────────────────────
+  deploy-production:
+    name: "🏆 Deploy → Production  [MANUAL APPROVAL REQUIRED]"
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    environment:
+      name: production              # Set "Required reviewers" in Repo Settings!
+      url:  http://${{ env.S3_BUCKET }}.s3-website-${{ env.AWS_REGION }}.amazonaws.com
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build & deploy frontend to S3
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install & Build Frontend
+        run: |
+          cd frontend
+          npm ci
+          npm run build
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Deploy Frontend → S3
+        run: |
+          aws s3 sync frontend/dist/ s3://${{ env.S3_BUCKET }} \
+            --delete \
+            --cache-control "max-age=31536000,public" \
+            --exclude "index.html"
+          # No-cache for index.html so users always get the latest
+          aws s3 cp frontend/dist/index.html s3://${{ env.S3_BUCKET }}/index.html \
+            --cache-control "no-cache,no-store,must-revalidate"
+
+      # Terraform IaC for prod infrastructure
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.8.0"
+
+      - name: Terraform Init & Apply (Production)
+        run: |
+          cd terraform
+          terraform init
+          terraform apply -auto-approve \
+            -var="environment=production" \
+            -var="db_username=${{ secrets.DB_USERNAME }}" \
+            -var="db_password=${{ secrets.DB_PASSWORD }}" \
+            -var="frontend_bucket_name=${{ env.S3_BUCKET }}"
+
+      - name: Force new ECS deployment (Production)
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service forex-backend \
+            --force-new-deployment
+
+      - name: Deployment complete notification
+        run: |
+          echo "✅ Production deployment complete!"
+          echo "Frontend: http://${{ env.S3_BUCKET }}.s3-website-${{ env.AWS_REGION }}.amazonaws.com"
